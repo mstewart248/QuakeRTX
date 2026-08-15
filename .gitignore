@@ -18,3 +18,14 @@
 # MSBuild output directories
 Windows/VisualStudio/Build-QSS/
 Windows/VisualStudio/Build-QSS-SDL1/
+
+# Visual Studio CMake integration cache (machine-specific absolute paths)
+out/
+
+# Visual Studio project-upgrade leftovers
+Windows/VisualStudio/Backup/
+Windows/VisualStudio/UpgradeLog.htm
+
+# Per-user MSBuild debug settings
+*.vcxproj.user
+*.suo
