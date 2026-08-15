@@ -1,0 +1,20 @@
+# Visual Studio per-user state and IntelliSense databases
+.vs/
+
+# build output
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.lastbuildstate
+*.log
+*.res
+*.dep
+*.o
+*.d
+
+# MSBuild output directories
+Windows/VisualStudio/Build-QSS/
+Windows/VisualStudio/Build-QSS-SDL1/
