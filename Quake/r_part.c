@@ -45,6 +45,43 @@ float texturescalefactor; //johnfitz -- compensate for apparent size of differen
 
 cvar_t	r_particles = {"r_particles","1", CVAR_ARCHIVE}; //johnfitz
 cvar_t	r_quadparticles = {"r_quadparticles","1", CVAR_ARCHIVE}; //johnfitz
+cvar_t	r_particlecolortex = {"r_particlecolortex","1", CVAR_ARCHIVE};
+
+/*
+	The particle shapes, at file scope so the per-colour tinting below can
+	reread the one that is currently selected.
+*/
+static byte	particle1_data[64*64*4];
+static byte	particle2_data[2*2*4];
+static byte	particle3_data[64*64*4];
+
+/*
+	Per-colour particle textures.
+
+	Every particle in the game is the same white blob modulated by a vertex
+	colour. That is fine for rasterising and useless for RTX Remix, which
+	identifies a material by hashing the texture bound to the draw: blood,
+	smoke, gunfire and teleport sparkles all arrive under one hash, so there is
+	no way to replace one of them without replacing all of them.
+
+	So bake the palette colour into the texture instead. Each palette index
+	that actually turns up gets its own copy of the current particle shape with
+	that colour multiplied in, and the vertices go out white. The rasterised
+	result is unchanged -- shape*colour and colour*shape are the same product --
+	but every colour now hashes separately and can be overridden on its own.
+
+	Built lazily. A map typically touches thirty or forty of the 256 indices,
+	and generating all of them up front would cost 4MB of texture for nothing.
+
+	The tinted pixels have to outlive the call: TexMgr keeps the pointer as the
+	texture's source and reads it back through TexMgr_ReloadImage on every
+	vid_restart, so these buffers are freed only alongside their texture.
+*/
+static gltexture_t	*particlecolortexture[256];
+static byte		*particlecolordata[256];
+
+//particles bucketed by colour for the batching in R_DrawParticles
+static particle_t	**particlesortbuf;
 
 /*
 ===============
@@ -73,9 +110,6 @@ R_InitParticleTextures -- johnfitz -- rewritten
 void R_InitParticleTextures (void)
 {
 	int			x,y;
-	static byte	particle1_data[64*64*4];
-	static byte	particle2_data[2*2*4];
-	static byte	particle3_data[64*64*4];
 	byte		*dst;
 
 	// particle texture 1 -- circle
@@ -121,6 +155,98 @@ void R_InitParticleTextures (void)
 
 /*
 ===============
+R_FreeParticleColorTextures -- drops the tinted set, e.g. when the shape changes
+===============
+*/
+static void R_FreeParticleColorTextures (void)
+{
+	int i;
+
+	for (i = 0; i < 256; i++)
+	{
+		if (particlecolortexture[i])
+		{
+			TexMgr_FreeTexture (particlecolortexture[i]);
+			particlecolortexture[i] = NULL;
+		}
+
+		//only safe once the texture that sourced from it is gone
+		if (particlecolordata[i])
+		{
+			free (particlecolordata[i]);
+			particlecolordata[i] = NULL;
+		}
+	}
+}
+
+/*
+===============
+R_ParticleColorTexture -- the current particle shape tinted by a palette index
+
+Falls back to the shared untinted texture if it cannot build one, so a failure
+here costs Remix the separate hash and nothing else.
+===============
+*/
+static gltexture_t *R_ParticleColorTexture (int color)
+{
+	char		name[32];
+	const byte	*src, *pal;
+	byte		*dst;
+	int		i, w, h, count;
+	unsigned	flags;
+
+	color &= 255;
+
+	if (particlecolortexture[color])
+		return particlecolortexture[color];
+
+	if (particletexture == particletexture2)
+	{
+		src = particle2_data;
+		w = h = 2;
+		flags = TEXPREF_PERSIST | TEXPREF_ALPHA | TEXPREF_NEAREST;
+	}
+	else
+	{
+		src = particle1_data;
+		w = h = 64;
+		flags = TEXPREF_PERSIST | TEXPREF_ALPHA | TEXPREF_LINEAR;
+	}
+
+	count = w * h;
+
+	dst = (byte *) malloc ((size_t)count * 4);
+	if (!dst)
+		return particletexture;
+
+	pal = (const byte *) &d_8to24table[color];
+
+	//multiply rather than assign: the shape's own RGB is white today, but this
+	//stays right if a future shape carries colour of its own
+	for (i = 0; i < count; i++)
+	{
+		dst[i*4+0] = (byte)((src[i*4+0] * pal[0] + 127) / 255);
+		dst[i*4+1] = (byte)((src[i*4+1] * pal[1] + 127) / 255);
+		dst[i*4+2] = (byte)((src[i*4+2] * pal[2] + 127) / 255);
+		dst[i*4+3] = src[i*4+3];	//shape, untouched
+	}
+
+	q_snprintf (name, sizeof(name), "particle_c%03d", color);
+	particlecolortexture[color] = TexMgr_LoadImage (NULL, name, w, h, SRC_RGBA, dst, "",
+							(src_offset_t)dst, flags);
+
+	if (!particlecolortexture[color])
+	{
+		free (dst);
+		return particletexture;
+	}
+
+	particlecolordata[color] = dst;
+	return particlecolortexture[color];
+}
+
+/*
+===============
 R_SetParticleTexture_f -- johnfitz
 ===============
 */
@@ -141,6 +267,9 @@ static void R_SetParticleTexture_f (cvar_t *var)
 //		texturescalefactor = 1.5;
 //		break;
 	}
+
+	//the tinted copies are of whichever shape was current when they were made
+	R_FreeParticleColorTextures ();
 }
 
 /*
@@ -168,9 +297,13 @@ void R_InitParticles (void)
 	particles = (particle_t *)
 			Hunk_AllocName (r_numparticles * sizeof(particle_t), "particles");
 
+	particlesortbuf = (particle_t **)
+			Hunk_AllocName (r_numparticles * sizeof(particle_t *), "partsort");
+
 	Cvar_RegisterVariable (&r_particles); //johnfitz
 	Cvar_SetCallback (&r_particles, R_SetParticleTexture_f);
 	Cvar_RegisterVariable (&r_quadparticles); //johnfitz
+	Cvar_RegisterVariable (&r_particlecolortex);
 
 	R_InitParticleTextures (); //johnfitz
 }
@@ -837,15 +970,132 @@ void CL_RunParticles (void)
 
 /*
 ===============
+R_ParticleScale -- hack a scale up to keep particles from disapearing
+===============
+*/
+static float R_ParticleScale (const particle_t *p)
+{
+	float scale = (p->org[0] - r_origin[0]) * vpn[0]
+		    + (p->org[1] - r_origin[1]) * vpn[1]
+		    + (p->org[2] - r_origin[2]) * vpn[2];
+
+	if (scale < 20)
+		scale = 1 + 0.08; //johnfitz -- added .08 to be consistent
+	else
+		scale = 1 + scale * 0.004;
+
+	return scale * texturescalefactor; //johnfitz -- compensate for apparent size of different particle textures
+}
+
+/*
+===============
+R_EmitParticle -- one particle's geometry, inside an already open glBegin
+
+Colour is the caller's business: the shared-texture path sets it per particle,
+the per-colour path has it baked into the texture and leaves the vertices
+white.
+===============
+*/
+static void R_EmitParticle (const particle_t *p, qboolean quad, const vec3_t up, const vec3_t right)
+{
+	vec3_t	p_up, p_right, p_upright; //johnfitz -- p_ vectors
+	float	scale = R_ParticleScale (p);
+
+	if (quad) //johnitz -- quads save fillrate
+	{
+		scale *= 0.5; //quad is half the size of triangle
+
+		glTexCoord2f (0,0);
+		glVertex3fv (p->org);
+
+		glTexCoord2f (0.5,0);
+		VectorMA (p->org, scale, up, p_up);
+		glVertex3fv (p_up);
+
+		glTexCoord2f (0.5,0.5);
+		VectorMA (p_up, scale, right, p_upright);
+		glVertex3fv (p_upright);
+
+		glTexCoord2f (0,0.5);
+		VectorMA (p->org, scale, right, p_right);
+		glVertex3fv (p_right);
+	}
+	else //johnitz --  triangles save verts
+	{
+		glTexCoord2f (0,0);
+		glVertex3fv (p->org);
+
+		glTexCoord2f (1,0);
+		VectorMA (p->org, scale, up, p_up);
+		glVertex3fv (p_up);
+
+		glTexCoord2f (0,1);
+		VectorMA (p->org, scale, right, p_right);
+		glVertex3fv (p_right);
+	}
+}
+
+/*
+===============
+R_DrawParticlesByColor
+
+One batch per palette index in use, each against its own tinted texture, so
+Remix sees a separate material hash per particle colour. See the comment on
+particlecolortexture for why.
+
+The bucketing is a counting sort over the active list -- two passes and no
+comparisons -- so this costs one traversal more than the shared-texture path.
+===============
+*/
+static void R_DrawParticlesByColor (qboolean quad, const vec3_t up, const vec3_t right)
+{
+	particle_t	*p;
+	int		counts[256], offsets[256], cursor[256];
+	int		i, n, total;
+
+	memset (counts, 0, sizeof(counts));
+
+	for (p = active_particles; p; p = p->next)
+		counts[(int)p->color & 255]++;
+
+	for (i = 0, total = 0; i < 256; i++)
+	{
+		offsets[i] = cursor[i] = total;
+		total += counts[i];
+	}
+
+	//every active particle comes out of the fixed pool, so this cannot overrun
+	for (p = active_particles; p; p = p->next)
+		particlesortbuf[cursor[(int)p->color & 255]++] = p;
+
+	//white vertices: the colour lives in the texture now
+	glColor4f (1,1,1,1);
+
+	for (i = 0; i < 256; i++)
+	{
+		if (!counts[i])
+			continue;
+
+		GL_Bind (R_ParticleColorTexture (i));
+
+		glBegin (quad ? GL_QUADS : GL_TRIANGLES);
+		for (n = offsets[i]; n < offsets[i] + counts[i]; n++)
+			R_EmitParticle (particlesortbuf[n], quad, up, right);
+		glEnd ();
+	}
+}
+
+/*
+===============
 R_DrawParticles -- johnfitz -- moved all non-drawing code to CL_RunParticles
 ===============
 */
 void R_DrawParticles (void)
 {
 	particle_t		*p;
-	float			scale;
-	vec3_t			up, right, p_up, p_right, p_upright; //johnfitz -- p_ vectors
+	vec3_t			up, right;
 	GLubyte			color[4], *c; //johnfitz -- particle transparency
+	qboolean		quad, percolour;
 	extern	cvar_t	r_particles; //johnfitz
 	//float			alpha; //johnfitz -- particle transparency
 
@@ -859,29 +1109,29 @@ void R_DrawParticles (void)
 	VectorScale (vup, 1.5, up);
 	VectorScale (vright, 1.5, right);
 
-	GL_Bind(particletexture);
+	quad = r_quadparticles.value ? true : false;
+
+	/*
+		Per-colour textures earn their keep only under -d3d9, where the point
+		is handing Remix a hash per particle colour. The GL path would pay for
+		the extra binds and the split batches and get nothing back, so it keeps
+		drawing the whole list in one go against the shared white blob.
+	*/
+	percolour = (r_particlecolortex.value != 0) && D3D9_Active();
+
 	glEnable (GL_BLEND);
 	glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
 	glDepthMask (GL_FALSE); //johnfitz -- fix for particle z-buffer bug
 
-	if (r_quadparticles.value) //johnitz -- quads save fillrate
+	if (percolour)
+		R_DrawParticlesByColor (quad, up, right);
+	else
 	{
-		glBegin (GL_QUADS);
+		GL_Bind(particletexture);
+
+		glBegin (quad ? GL_QUADS : GL_TRIANGLES);
 		for (p=active_particles ; p ; p=p->next)
 		{
-			// hack a scale up to keep particles from disapearing
-			scale = (p->org[0] - r_origin[0]) * vpn[0]
-				  + (p->org[1] - r_origin[1]) * vpn[1]
-				  + (p->org[2] - r_origin[2]) * vpn[2];
-			if (scale < 20)
-				scale = 1 + 0.08; //johnfitz -- added .08 to be consistent
-			else
-				scale = 1 + scale * 0.004;
-
-			scale /= 2.0; //quad is half the size of triangle
-
-			scale *= texturescalefactor; //johnfitz -- compensate for apparent size of different particle textures
-
 			//johnfitz -- particle transparency and fade out
 			c = (GLubyte *) &d_8to24table[(int)p->color];
 			color[0] = c[0];
@@ -892,59 +1142,7 @@ void R_DrawParticles (void)
 			glColor4ubv(color);
 			//johnfitz
 
-			glTexCoord2f (0,0);
-			glVertex3fv (p->org);
-
-			glTexCoord2f (0.5,0);
-			VectorMA (p->org, scale, up, p_up);
-			glVertex3fv (p_up);
-
-			glTexCoord2f (0.5,0.5);
-			VectorMA (p_up, scale, right, p_upright);
-			glVertex3fv (p_upright);
-
-			glTexCoord2f (0,0.5);
-			VectorMA (p->org, scale, right, p_right);
-			glVertex3fv (p_right);
-		}
-		glEnd ();
-	}
-	else //johnitz --  triangles save verts
-	{
-		glBegin (GL_TRIANGLES);
-		for (p=active_particles ; p ; p=p->next)
-		{
-			// hack a scale up to keep particles from disapearing
-			scale = (p->org[0] - r_origin[0]) * vpn[0]
-				  + (p->org[1] - r_origin[1]) * vpn[1]
-				  + (p->org[2] - r_origin[2]) * vpn[2];
-			if (scale < 20)
-				scale = 1 + 0.08; //johnfitz -- added .08 to be consistent
-			else
-				scale = 1 + scale * 0.004;
-
-			scale *= texturescalefactor; //johnfitz -- compensate for apparent size of different particle textures
-
-			//johnfitz -- particle transparency and fade out
-			c = (GLubyte *) &d_8to24table[(int)p->color];
-			color[0] = c[0];
-			color[1] = c[1];
-			color[2] = c[2];
-			//alpha = CLAMP(0, p->die + 0.5 - cl.time, 1);
-			color[3] = 255; //(int)(alpha * 255);
-			glColor4ubv(color);
-			//johnfitz
-
-			glTexCoord2f (0,0);
-			glVertex3fv (p->org);
-
-			glTexCoord2f (1,0);
-			VectorMA (p->org, scale, up, p_up);
-			glVertex3fv (p_up);
-
-			glTexCoord2f (0,1);
-			VectorMA (p->org, scale, right, p_right);
-			glVertex3fv (p_right);
+			R_EmitParticle (p, quad, up, right);
 		}
 		glEnd ();
 	}

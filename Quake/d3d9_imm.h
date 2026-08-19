@@ -43,6 +43,10 @@ void QGL_LoadIdentity (void);
 void QGL_Ortho (double l, double r, double b, double t, double n, double f);
 void QGL_Viewport (int x, int y, int w, int h);
 
+//called by the backend when the 3D pass writes D3DTS_PROJECTION itself, so a
+//later glViewport does not restore the 2D ortho over the top of it
+void QGL_ProjectionOverridden (void);
+
 #ifndef D3D9_IMM_IMPLEMENTATION
 
 #define glBegin		QGL_Begin

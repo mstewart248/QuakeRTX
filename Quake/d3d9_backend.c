@@ -26,6 +26,9 @@
 
 #include "d3d9_backend.h"
 
+//provided by the immediate-mode shim in d3d9_imm.c
+extern void QGL_ProjectionOverridden (void);
+
 static LPDIRECT3D9		d3d9_object = NULL;
 static LPDIRECT3DDEVICE9	d3d9_device = NULL;
 static D3DPRESENT_PARAMETERS	d3d9_presentparams;
@@ -130,6 +133,46 @@ static void D3D9_ReportAdapter (void)
 }
 
 static void D3D9_ProbeLightCapacity (void);
+static void D3D9_ApplyDefaultState (void);
+static void D3D9_InvalidateCachedState (void);
+
+/*
+===============
+D3D9_ApplyDefaultState
+
+Stands in for GL_SetupState, which never runs under -d3d9.
+
+These are the global defaults the engine assumes exist: several draw paths
+enable blending or alpha testing without ever setting the factors, because
+GLQuake set them once at startup. Left at D3D9's own defaults (SRCBLEND=ONE,
+DESTBLEND=ZERO) alpha is simply ignored, and blended content such as particles
+renders as opaque black quads.
+
+IDirect3DDevice9::Reset throws every render state back to those D3D9 defaults,
+so this has to run again after each successful reset -- a resolution change or
+a fullscreen toggle otherwise leaves the engine drawing with SRCBLEND=ONE,
+DESTBLEND=ZERO and the alpha test wide open, which is what makes the HUD, menu
+and console lose their transparency after vid_restart.
+===============
+*/
+static void D3D9_ApplyDefaultState (void)
+{
+	if (!d3d9_device)
+		return;
+
+	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+
+	//glAlphaFunc(GL_GREATER, 0.666) -- 0.666*255 = 170. Fences and grates
+	//depend on this threshold; 127 lets through pixels GL would have cut.
+	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_ALPHATESTENABLE, TRUE);
+	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_ALPHAREF, 170);
+	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+
+	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_SHADEMODE, D3DSHADE_FLAT);	//glShadeModel(GL_FLAT)
+	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_LIGHTING, FALSE);
+}
 
 /*
 ===============
@@ -239,27 +282,8 @@ qboolean D3D9_Init (void *hwnd, int width, int height, qboolean fullscreen)
 	*/
 	_controlfp_s (NULL, _PC_53, _MCW_PC);
 
-	/*
-		Stand in for GL_SetupState, which never runs under -d3d9.
-
-		These are the global defaults the engine assumes exist: several draw
-		paths enable blending or alpha testing without ever setting the
-		factors, because GLQuake set them once at startup. Left at D3D9's own
-		defaults (SRCBLEND=ONE, DESTBLEND=ZERO) alpha is simply ignored, and
-		blended content such as particles renders as opaque black quads.
-	*/
-	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-
-	//glAlphaFunc(GL_GREATER, 0.666) -- 0.666*255 = 170. Fences and grates
-	//depend on this threshold; 127 lets through pixels GL would have cut.
-	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_ALPHATESTENABLE, TRUE);
-	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_ALPHAREF, 170);
-	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_ALPHAFUNC, D3DCMP_GREATER);
-
-	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
-	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_SHADEMODE, D3DSHADE_FLAT);	//glShadeModel(GL_FLAT)
-	IDirect3DDevice9_SetRenderState (d3d9_device, D3DRS_LIGHTING, FALSE);
+	D3D9_ApplyDefaultState ();
+	D3D9_InvalidateCachedState ();
 
 	d3d9_active = true;
 	d3d9_devicelost = false;
@@ -324,6 +348,17 @@ static qboolean D3D9_ResetDevice (void)
 	hr = IDirect3DDevice9_Reset (d3d9_device, &d3d9_presentparams);
 	if (FAILED(hr))
 		return false;
+
+	/*
+		Reset does not preserve device state. Render states, texture stage and
+		sampler states, transforms, lights and texture bindings all return to
+		the runtime's defaults, and nothing else puts them back: GL_SetupState
+		is a no-op under -d3d9, and the per-frame setup only touches the states
+		it varies. Reassert the startup defaults and drop every cache that
+		claims to know what the device already has.
+	*/
+	D3D9_ApplyDefaultState ();
+	D3D9_InvalidateCachedState ();
 
 	d3d9_devicelost = false;
 	return true;
@@ -669,6 +704,32 @@ void D3D9_DestroyTexture (void *tex)
 }
 
 /*
+===============
+D3D9_InvalidateCachedState
+
+Drops the redundancy caches that shadow device state, for use after a reset
+has silently cleared the device side of them.
+
+The texture cache is the one that bites: Reset unbinds every stage, but
+d3d9_boundtexture still names whatever was bound before, so D3D9_BindTexture
+short-circuits and the next draw samples a stage with no texture in it. That
+is enough on its own to turn the charset, HUD and menu into garbage after a
+mode change. Clearing it also forces the sampler state to be reapplied, which
+Reset dropped back to point filtering and wrap addressing.
+===============
+*/
+static void D3D9_InvalidateCachedState (void)
+{
+	int i;
+
+	for (i = 0; i < D3D9_MAX_STAGES; i++)
+		d3d9_boundtexture[i] = NULL;
+
+	//every light slot comes back disabled, so nothing needs turning off
+	d3d9_activelights = 0;
+}
+
+/*
 =============================================================================
 
 3D VIEW SETUP
@@ -715,6 +776,10 @@ void D3D9_SetProjectionFromGL (const float *glmatrix)
 
 	if (!d3d9_device)
 		return;
+
+	//the 2D shim owns D3DTS_PROJECTION between canvases; tell it we are taking
+	//it, so the next glViewport does not put the last ortho back
+	QGL_ProjectionOverridden ();
 
 	D3D9_TransposeGLMatrix (glmatrix, &m);
 

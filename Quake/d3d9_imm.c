@@ -20,7 +20,11 @@
 //provided by d3d9_backend.c
 extern LPDIRECT3DDEVICE9 D3D9_GetDevice (void);
 
-#define D3D9_MAX_IMM_VERTS	1024
+/*
+	Batch size. Big enough that a full particle list -- 2048 quads, so 8192
+	vertices -- goes out without splitting.
+*/
+#define D3D9_MAX_IMM_VERTS	8192
 
 typedef struct
 {
@@ -32,6 +36,9 @@ typedef struct
 #define D3D9_IMM_FVF	(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1)
 
 static d3d9immvert_t	imm_verts[D3D9_MAX_IMM_VERTS];
+
+//quads expanded to a triangle list for submission: six vertices per four
+static d3d9immvert_t	imm_quadverts[D3D9_MAX_IMM_VERTS / 4 * 6];
 static int		imm_numverts = 0;
 static GLenum		imm_mode = 0;
 static qboolean		imm_active = false;
@@ -55,6 +62,25 @@ static DWORD		imm_savedlighting = FALSE;
 
 //current viewport, kept so the projection can carry the half-texel correction
 static int		imm_vp_w = 1, imm_vp_h = 1;
+
+/*
+	Last glOrtho, kept so the projection can be rebuilt when the viewport moves
+	under it.
+
+	GL_SetCanvas sets every canvas as glOrtho followed by glViewport, and the
+	half-texel correction in QGL_ApplyOrtho is sized from the viewport, so
+	applying the ortho as it arrives sizes that correction from the *previous*
+	canvas. Within a steady frame that is a small constant error; across a
+	resolution change or a fullscreen toggle the stale size belongs to a
+	different resolution entirely and the whole 2D layer lands off-pixel.
+
+	imm_ortho_active says the projection currently belongs to us. The 3D pass
+	writes D3DTS_PROJECTION directly through D3D9_SetProjectionFromGL, which
+	calls QGL_ProjectionOverridden to clear the flag, so a glViewport issued
+	during 3D setup cannot stamp a stale 2D ortho over it.
+*/
+static double		imm_ortho[6];
+static qboolean		imm_ortho_active = false;
 
 /*
 ===============
@@ -141,11 +167,36 @@ static void QGL_Flush (void)
 
 	if (imm_mode == GL_QUADS)
 	{
-		//D3D9 has no quad primitive; each group of four verts is a fan of two
-		//triangles, which matches GL_QUADS winding for the convex quads the
-		//2D code emits.
-		for (i = 0; i + 3 < imm_numverts; i += 4)
-			IDirect3DDevice9_DrawPrimitiveUP (dev, D3DPT_TRIANGLEFAN, 2, &imm_verts[i], sizeof(d3d9immvert_t));
+		/*
+			D3D9 has no quad primitive. Expand each group of four vertices into
+			the two triangles a fan would have produced -- (0,1,2) and (0,2,3),
+			same winding -- and submit the batch as one triangle list.
+
+			Doing this per quad instead, which is what a fan per group of four
+			amounts to, costs one draw call each. That is survivable for a few
+			dozen glyphs and ruinous for particles: a full list is 2048 draw
+			calls a frame, and under the Remix bridge every one of them is
+			marshalled across to a separate 64 bit host process.
+		*/
+		int quads = imm_numverts / 4;
+		int n = 0;
+
+		for (i = 0; i < quads; i++)
+		{
+			const d3d9immvert_t *q = &imm_verts[i * 4];
+
+			imm_quadverts[n++] = q[0];
+			imm_quadverts[n++] = q[1];
+			imm_quadverts[n++] = q[2];
+
+			imm_quadverts[n++] = q[0];
+			imm_quadverts[n++] = q[2];
+			imm_quadverts[n++] = q[3];
+		}
+
+		if (quads)
+			IDirect3DDevice9_DrawPrimitiveUP (dev, D3DPT_TRIANGLELIST, quads * 2,
+								imm_quadverts, sizeof(d3d9immvert_t));
 	}
 	else if ((imm_mode == GL_TRIANGLE_FAN || imm_mode == GL_POLYGON) && imm_numverts >= 3)
 	{
@@ -198,7 +249,27 @@ void QGL_TexCoord2f (float s, float t)
 
 static void QGL_PushVertex (float x, float y, float z)
 {
-	d3d9immvert_t *v;
+	d3d9immvert_t	*v;
+	int		group;
+
+	/*
+		Split the batch when it fills, rather than dropping the tail.
+
+		A busy scene puts far more than D3D9_MAX_IMM_VERTS through one
+		glBegin/glEnd: 2048 particles as quads is 8192 vertices, so everything
+		past the first 256 particles used to vanish, and a blood spray simply
+		stopped halfway.
+
+		Only the modes built from independent primitives can be cut, and only
+		on a primitive boundary -- a fan or a strip shares vertices between
+		triangles, so splitting one would lose the triangles spanning the cut.
+		Those keep the old drop behaviour, which nothing reaches in practice:
+		DrawGLPoly hands over one surface at a time, far short of the buffer.
+	*/
+	group = (imm_mode == GL_QUADS) ? 4 : (imm_mode == GL_TRIANGLES) ? 3 : 0;
+
+	if (group && (imm_numverts % group) == 0 && imm_numverts + group > D3D9_MAX_IMM_VERTS)
+		QGL_Flush ();	//draws what we have and leaves imm_numverts at 0
 
 	if (imm_numverts >= D3D9_MAX_IMM_VERTS)
 		return;		//drop rather than overrun
@@ -456,16 +527,22 @@ void QGL_LoadIdentity (void)
 	IDirect3DDevice9_SetTransform (dev, D3DTS_VIEW, &m);
 }
 
-void QGL_Ortho (double l, double r, double b, double t, double n, double f)
+/*
+===============
+QGL_ApplyOrtho -- (re)builds D3DTS_PROJECTION from imm_ortho and the viewport
+===============
+*/
+static void QGL_ApplyOrtho (void)
 {
 	LPDIRECT3DDEVICE9	dev;
 	D3DMATRIX		m;
+	double			l = imm_ortho[0], r = imm_ortho[1];
+	double			b = imm_ortho[2], t = imm_ortho[3];
+	double			n = imm_ortho[4], f = imm_ortho[5];
 	float			halfx, halfy;
 
-	if (!D3D9_Active()) { glOrtho (l, r, b, t, n, f); return; }
-
 	dev = D3D9_GetDevice ();
-	if (!dev)
+	if (!dev || r == l || t == b || n == f)
 		return;
 
 	/*
@@ -493,6 +570,28 @@ void QGL_Ortho (double l, double r, double b, double t, double n, double f)
 	IDirect3DDevice9_SetTransform (dev, D3DTS_PROJECTION, &m);
 }
 
+void QGL_Ortho (double l, double r, double b, double t, double n, double f)
+{
+	if (!D3D9_Active()) { glOrtho (l, r, b, t, n, f); return; }
+
+	imm_ortho[0] = l; imm_ortho[1] = r;
+	imm_ortho[2] = b; imm_ortho[3] = t;
+	imm_ortho[4] = n; imm_ortho[5] = f;
+	imm_ortho_active = true;
+
+	QGL_ApplyOrtho ();
+}
+
+/*
+===============
+QGL_ProjectionOverridden -- the 3D pass has taken D3DTS_PROJECTION off us
+===============
+*/
+void QGL_ProjectionOverridden (void)
+{
+	imm_ortho_active = false;
+}
+
 void QGL_Viewport (int x, int y, int w, int h)
 {
 	LPDIRECT3DDEVICE9	dev;
@@ -507,8 +606,16 @@ void QGL_Viewport (int x, int y, int w, int h)
 	if (w < 1) w = 1;
 	if (h < 1) h = 1;
 
-	imm_vp_w = w;
-	imm_vp_h = h;
+	if (imm_vp_w != w || imm_vp_h != h)
+	{
+		imm_vp_w = w;
+		imm_vp_h = h;
+
+		//the half-texel correction is sized from the viewport, and glOrtho
+		//always arrives first, so the ortho has to be rebuilt here
+		if (imm_ortho_active)
+			QGL_ApplyOrtho ();
+	}
 
 	//GL measures the viewport from the bottom left, D3D9 from the top left
 	vp.X = (DWORD)x;
@@ -546,5 +653,6 @@ void QGL_MatrixMode (GLenum m) { glMatrixMode (m); }
 void QGL_LoadIdentity (void) { glLoadIdentity (); }
 void QGL_Ortho (double l, double r, double b, double t, double n, double f) { glOrtho (l, r, b, t, n, f); }
 void QGL_Viewport (int x, int y, int w, int h) { glViewport (x, y, w, h); }
+void QGL_ProjectionOverridden (void) { }
 
 #endif	/* _WIN32 */
