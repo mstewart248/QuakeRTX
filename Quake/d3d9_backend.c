@@ -610,24 +610,49 @@ void D3D9_UploadLevel (void *tex, int level, int width, int height, const void *
 
 /*
 ===============
-D3D9_SetTextureFilter
+D3D9_TranslateFilter -- D3D9_FILTER_* to the D3DTEXF_* the sampler wants
 ===============
 */
-void D3D9_SetTextureFilter (void *tex, qboolean mipmap, qboolean nearest, qboolean clamp, int anisotropy)
+static DWORD D3D9_TranslateFilter (int filter, DWORD fallback)
+{
+	switch (filter)
+	{
+	case D3D9_FILTER_POINT:		return D3DTEXF_POINT;
+	case D3D9_FILTER_LINEAR:	return D3DTEXF_LINEAR;
+	case D3D9_FILTER_NOMIP:		return D3DTEXF_NONE;
+	default:			return fallback;
+	}
+}
+
+/*
+===============
+D3D9_SetTextureFilter
+
+minfilter/magfilter/mipfilter are D3D9_FILTER_* values, kept separate so the
+caller can ask for any of the combinations gl_texturemode names -- bilinear
+(linear min/mag, point mip) is a different thing from trilinear (linear
+throughout), and a point mipfilter is a different thing again from
+D3D9_FILTER_NOMIP, which ignores the mip chain entirely.
+===============
+*/
+void D3D9_SetTextureFilter (void *tex, int minfilter, int magfilter, int mipfilter, qboolean clamp, int anisotropy)
 {
 	d3d9texture_t *t = (d3d9texture_t *)tex;
 
 	if (!t)
 		return;
 
-	t->minfilter = nearest ? D3DTEXF_POINT : D3DTEXF_LINEAR;
-	t->magfilter = nearest ? D3DTEXF_POINT : D3DTEXF_LINEAR;
-	t->mipfilter = !mipmap ? D3DTEXF_NONE : (nearest ? D3DTEXF_POINT : D3DTEXF_LINEAR);
+	t->minfilter = D3D9_TranslateFilter (minfilter, D3DTEXF_LINEAR);
+	t->magfilter = D3D9_TranslateFilter (magfilter, D3DTEXF_LINEAR);
+	t->mipfilter = D3D9_TranslateFilter (mipfilter, D3DTEXF_NONE);
 	t->address   = clamp ? D3DTADDRESS_CLAMP : D3DTADDRESS_WRAP;
 	t->maxaniso  = (anisotropy > 1) ? (DWORD)anisotropy : 1;
 
-	//anisotropic minification only makes sense with a mip chain
-	if (t->maxaniso > 1 && mipmap && !nearest)
+	//anisotropic minification only makes sense with a mip chain to walk, and
+	//only when minification was going to blend texels in the first place --
+	//asking for it on a point filter would undo the blockiness that was the
+	//whole point of choosing one
+	if (t->maxaniso > 1 && t->mipfilter != D3DTEXF_NONE && t->minfilter == D3DTEXF_LINEAR)
 		t->minfilter = D3DTEXF_ANISOTROPIC;
 
 	//force reapplication on the next bind
@@ -1291,9 +1316,24 @@ void D3D9_DrawSkyFace (int face)
 
 	IDirect3DDevice9_SetSamplerState (d3d9_device, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
 	IDirect3DDevice9_SetSamplerState (d3d9_device, 0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-	IDirect3DDevice9_SetSamplerState (d3d9_device, 0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-	IDirect3DDevice9_SetSamplerState (d3d9_device, 0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-	IDirect3DDevice9_SetSamplerState (d3d9_device, 0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+
+	//the addressing above is the reason this block exists, but the filters have
+	//to be restated alongside it or the sky would ignore gl_texturemode /
+	//d3d9_texturefilter and stay smooth with filtering turned off. Take them
+	//from the bound texture, which is where TexMgr_SetFilterModes put them.
+	{
+		const d3d9texture_t	*t = d3d9_boundtexture[0];
+		DWORD			minf = t ? t->minfilter : D3DTEXF_LINEAR;
+		DWORD			magf = t ? t->magfilter : D3DTEXF_LINEAR;
+
+		//no mip chain is walked here, so anisotropy has nothing to sample along
+		if (minf == D3DTEXF_ANISOTROPIC)
+			minf = D3DTEXF_LINEAR;
+
+		IDirect3DDevice9_SetSamplerState (d3d9_device, 0, D3DSAMP_MINFILTER, minf);
+		IDirect3DDevice9_SetSamplerState (d3d9_device, 0, D3DSAMP_MAGFILTER, magf);
+		IDirect3DDevice9_SetSamplerState (d3d9_device, 0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+	}
 
 	IDirect3DDevice9_DrawPrimitive (d3d9_device, D3DPT_TRIANGLEFAN, (UINT)(face * 4), 2);
 }
@@ -2116,7 +2156,7 @@ qboolean D3D9_BeginFrame (void) { return false; }
 void D3D9_EndFrame (void) {}
 void *D3D9_CreateTexture (int width, int height, int levels, qboolean alpha) { (void)width; (void)height; (void)levels; (void)alpha; return NULL; }
 void D3D9_UploadLevel (void *tex, int level, int width, int height, const void *rgba) { (void)tex; (void)level; (void)width; (void)height; (void)rgba; }
-void D3D9_SetTextureFilter (void *tex, qboolean mipmap, qboolean nearest, qboolean clamp, int anisotropy) { (void)tex; (void)mipmap; (void)nearest; (void)clamp; (void)anisotropy; }
+void D3D9_SetTextureFilter (void *tex, int minfilter, int magfilter, int mipfilter, qboolean clamp, int anisotropy) { (void)tex; (void)minfilter; (void)magfilter; (void)mipfilter; (void)clamp; (void)anisotropy; }
 void D3D9_BindTexture (int stage, void *tex) { (void)stage; (void)tex; }
 void D3D9_DestroyTexture (void *tex) { (void)tex; }
 int D3D9_TextureCount (void) { return 0; }

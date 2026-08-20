@@ -1765,6 +1765,10 @@ static void M_Extras_AdjustSliders (int dir)
 			Cvar_Set ("gl_texturemode", "GL_LINEAR_MIPMAP_LINEAR");
 			Cvar_SetValue ("gl_texture_anisotropy", m);
 		}
+		//this item speaks gl_texturemode, so hand it back the wheel: under the
+		//D3D9 backend an explicit d3d9_texturefilter would otherwise override
+		//everything set above and the menu would look broken
+		Cvar_Set ("d3d9_texturefilter", "-1");
 		break;
 	case EXTRAS_EXTERNALTEX:
 		Cvar_SetValueQuick (&gl_load24bit, !gl_load24bit.value);

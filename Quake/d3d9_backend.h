@@ -51,9 +51,23 @@ void D3D9_EndFrame (void);
 	D3D9_SetTextureFilter records the settings and D3D9_BindTexture applies
 	them when the texture is bound.
 */
+
+/*
+	Backend-neutral filter selectors for D3D9_SetTextureFilter. The rest of the
+	engine speaks GL enums, so gl_texmgr.c does the translating and the backend
+	never has to know which renderer the mode was written for.
+
+	The three of them combine into the usual choices: point/point is unfiltered,
+	linear/linear with a point mipfilter is bilinear, and linear all the way
+	through is trilinear.
+*/
+#define D3D9_FILTER_POINT	0	//take the nearest texel/mip level
+#define D3D9_FILTER_LINEAR	1	//blend neighbouring texels/mip levels
+#define D3D9_FILTER_NOMIP	2	//mipfilter only: sample the top level and stop
+
 void *D3D9_CreateTexture (int width, int height, int levels, qboolean alpha);
 void D3D9_UploadLevel (void *tex, int level, int width, int height, const void *rgba);
-void D3D9_SetTextureFilter (void *tex, qboolean mipmap, qboolean nearest, qboolean clamp, int anisotropy);
+void D3D9_SetTextureFilter (void *tex, int minfilter, int magfilter, int mipfilter, qboolean clamp, int anisotropy);
 void D3D9_BindTexture (int stage, void *tex);
 void D3D9_DestroyTexture (void *tex);
 

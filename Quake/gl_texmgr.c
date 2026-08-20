@@ -29,6 +29,16 @@ const int	gl_solid_format = 3;
 const int	gl_alpha_format = 4;
 
 static cvar_t	gl_texturemode = {"gl_texturemode", "", CVAR_ARCHIVE};
+/*
+	The D3D9 backend's own filtering selector, because gl_texturemode's GL enum
+	names are a poor fit for a renderer that has no GL in it:
+		-1  follow gl_texturemode (and so the Texture Filtering menu item)
+		 0  no filtering  -- point sampling, blocky texels
+		 1  bilinear      -- smooth within a mip level, hard cuts between levels
+		 2  trilinear     -- bilinear plus blending across mip levels
+	Ignored entirely when the GL renderer is running.
+*/
+static cvar_t	d3d9_texturefilter = {"d3d9_texturefilter", "-1", CVAR_ARCHIVE};
 static cvar_t	gl_texture_anisotropy = {"gl_texture_anisotropy", "1", CVAR_ARCHIVE};
 static cvar_t	gl_max_size = {"gl_max_size", "0", CVAR_NONE};
 static cvar_t	gl_picmip = {"gl_picmip", "0", CVAR_NONE};
@@ -175,6 +185,12 @@ static int glmode_idx = 5; /* trilinear */
 
 int TexMgr_GetTextureMode(void)
 {
+	//d3d9_texturefilter overrides gl_texturemode while it is not on -1, so the
+	//menu has to read it rather than the GL mode or it would report a filter
+	//that is not the one being drawn with
+	if (D3D9_Active() && d3d9_texturefilter.value >= 0)
+		return (d3d9_texturefilter.value == 0) ? 0 : q_max(1, gl_texture_anisotropy.value);
+
 	if (glmodes[glmode_idx].magfilter == GL_NEAREST)
 		return 0;
 	else
@@ -201,19 +217,68 @@ static void TexMgr_DescribeTextureModes_f (void)
 TexMgr_SetFilterModes
 ===============
 */
+static void TexMgr_D3D9FilterMode (int *minf, int *magf, int *mipf)
+{
+	switch ((int)d3d9_texturefilter.value)
+	{
+	case 0:		//unfiltered
+		*minf = *magf = *mipf = D3D9_FILTER_POINT;
+		return;
+	case 1:		//bilinear
+		*minf = *magf = D3D9_FILTER_LINEAR;
+		*mipf = D3D9_FILTER_POINT;
+		return;
+	case 2:		//trilinear
+		*minf = *magf = *mipf = D3D9_FILTER_LINEAR;
+		return;
+	default:	//-1, or anything unrecognised: whatever gl_texturemode says
+		break;
+	}
+
+	*magf = (glmodes[glmode_idx].magfilter == GL_NEAREST) ? D3D9_FILTER_POINT : D3D9_FILTER_LINEAR;
+
+	//the GL minfilter enum carries both halves: how texels are sampled within a
+	//level and how levels are blended between each other
+	switch (glmodes[glmode_idx].minfilter)
+	{
+	case GL_NEAREST:
+	case GL_NEAREST_MIPMAP_NEAREST:
+		*minf = D3D9_FILTER_POINT;	*mipf = D3D9_FILTER_POINT;	break;
+	case GL_NEAREST_MIPMAP_LINEAR:
+		*minf = D3D9_FILTER_POINT;	*mipf = D3D9_FILTER_LINEAR;	break;
+	case GL_LINEAR_MIPMAP_LINEAR:
+		*minf = D3D9_FILTER_LINEAR;	*mipf = D3D9_FILTER_LINEAR;	break;
+	case GL_LINEAR:
+	case GL_LINEAR_MIPMAP_NEAREST:
+	default:
+		*minf = D3D9_FILTER_LINEAR;	*mipf = D3D9_FILTER_POINT;	break;
+	}
+}
+
 static void TexMgr_SetFilterModes (gltexture_t *glt)
 {
 	if (D3D9_Active())
-	{	//gl_texturemode's "GL_NEAREST*" modes all have a point magfilter, which
-		//is what decides the blocky-vs-smooth look; mirror that test here.
-		qboolean nearest = (glt->flags & TEXPREF_NEAREST) ||
-				   (!(glt->flags & TEXPREF_LINEAR) && glmodes[glmode_idx].magfilter == GL_NEAREST);
-		qboolean mipmap  = (glt->flags & (TEXPREF_NEAREST | TEXPREF_LINEAR)) ? false : (glt->flags & TEXPREF_MIPMAP) != 0;
+	{
+		int	minf, magf, mipf;
+		qboolean mipmap = (glt->flags & (TEXPREF_NEAREST | TEXPREF_LINEAR)) ? false : (glt->flags & TEXPREF_MIPMAP) != 0;
+
+		TexMgr_D3D9FilterMode (&minf, &magf, &mipf);
+
+		//TEXPREF_NEAREST/TEXPREF_LINEAR are per-texture demands (charsets, the
+		//conback and so on) and outrank the global mode, exactly as they do in
+		//the GL path below
+		if (glt->flags & TEXPREF_NEAREST)
+			minf = magf = D3D9_FILTER_POINT;
+		else if (glt->flags & TEXPREF_LINEAR)
+			minf = magf = D3D9_FILTER_LINEAR;
+
+		if (!mipmap)
+			mipf = D3D9_FILTER_NOMIP;
 
 		//there is no TEXPREF for clamping -- QuakeSpasm leaves everything on
 		//GL's default wrap and clamps per-use where it matters. Stage 3 (2D
 		//drawing) is where that distinction starts to show, so revisit there.
-		D3D9_SetTextureFilter (glt->d3dtex, mipmap, nearest, false,
+		D3D9_SetTextureFilter (glt->d3dtex, minf, magf, mipf, false,
 					mipmap ? (int)gl_texture_anisotropy.value : 1);
 		return;
 	}
@@ -241,6 +306,22 @@ static void TexMgr_SetFilterModes (gltexture_t *glt)
 		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, glmodes[glmode_idx].magfilter);
 		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, glmodes[glmode_idx].magfilter);
 	}
+}
+
+/*
+===============
+TexMgr_D3D9TextureFilter_f -- called when d3d9_texturefilter changes
+===============
+*/
+static void TexMgr_D3D9TextureFilter_f (cvar_t *var)
+{
+	gltexture_t *glt;
+
+	if (!D3D9_Active())
+		return;
+
+	for (glt = active_gltextures; glt; glt = glt->next)
+		TexMgr_SetFilterModes (glt);
 }
 
 /*
@@ -734,6 +815,8 @@ void TexMgr_Init (void)
 	gl_texturemode.string = glmodes[glmode_idx].name1?glmodes[glmode_idx].name1:glmodes[glmode_idx].name2;
 	Cvar_RegisterVariable (&gl_texturemode);
 	Cvar_SetCallback (&gl_texturemode, &TexMgr_TextureMode_f);
+	Cvar_RegisterVariable (&d3d9_texturefilter);
+	Cvar_SetCallback (&d3d9_texturefilter, &TexMgr_D3D9TextureFilter_f);
 	Cmd_AddCommand ("gl_describetexturemodes", &TexMgr_DescribeTextureModes_f);
 	Cmd_AddCommand ("imagelist", &TexMgr_Imagelist_f);
 	Cmd_AddCommand ("imagedump", &TexMgr_Imagedump_f);
